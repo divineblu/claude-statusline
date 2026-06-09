@@ -1,199 +1,195 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# LZ Claude Code status line — PAI-style, 5-line layout
+# Receives Claude Code JSON on stdin; must stay fast (<100ms after first run)
 
-# Status line script for Claude Code
-# Displays: Folder:branch | Model | Usage (5h / 7d) | Weather
-
-# Read JSON input from stdin
 input=$(cat)
 
-# --- FOLDER + GIT BRANCH ---
-current_dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // ""')
-if [ -n "$current_dir" ] && [ -d "$current_dir" ]; then
-  folder_name=$(basename "$current_dir")
-  git_branch=$(git -C "$current_dir" rev-parse --abbrev-ref HEAD 2>/dev/null)
-  if [ -n "$git_branch" ]; then
-    folder_display="${folder_name}:${git_branch}"
+# ── Parse JSON fields ──────────────────────────────────────────────────────────
+_j() { echo "$input" | jq -r "$1 // empty"; }
+
+version=$(_j '.version')
+model=$(_j '.model.display_name')
+used=$(_j '.context_window.used_percentage')
+cost=$(_j '.cost_usd')
+duration_ms=$(_j '.total_duration_ms')
+rl_5h=$(_j '.rate_limits.five_hour.used_percentage')
+rl_7d=$(_j '.rate_limits.seven_day.used_percentage')
+rl_5h_reset=$(_j '.rate_limits.five_hour.resets_at')
+rl_7d_reset=$(_j '.rate_limits.seven_day.resets_at')
+cwd=$(_j '.workspace.current_dir')
+cwd="${cwd:-$(pwd)}"
+
+# ── ANSI helpers ───────────────────────────────────────────────────────────────
+RST=$'\033[0m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+BLUE=$'\033[34m'
+CYAN=$'\033[36m'
+GREEN=$'\033[32m'
+YELLOW=$'\033[33m'
+RED=$'\033[31m'
+BBLUE=$'\033[1;34m'   # bold blue
+SEP="${DIM}│${RST}"   # dim pipe separator
+
+# Dim separator line (horizontal rule)
+HRULE="${DIM}────────────────────────────────────────────────────────────${RST}"
+
+# ── Weather (cached, 30-min TTL, non-blocking) ─────────────────────────────────
+WEATHER_CACHE=/tmp/claude-statusline-weather
+weather=""
+_refresh_weather() {
+  ( curl -sf --max-time 5 'wttr.in/?format=%t+%C' > "${WEATHER_CACHE}.tmp" 2>/dev/null \
+    && mv "${WEATHER_CACHE}.tmp" "$WEATHER_CACHE" ) &
+  disown 2>/dev/null || true
+}
+if [ -f "$WEATHER_CACHE" ]; then
+  # stale if modified more than 30 min ago (find returns it if older)
+  if find "$WEATHER_CACHE" -mmin +30 -print 2>/dev/null | grep -q .; then
+    # use stale value, refresh in background
+    weather=$(cat "$WEATHER_CACHE" 2>/dev/null)
+    _refresh_weather
   else
-    folder_display="${folder_name}"
+    weather=$(cat "$WEATHER_CACHE" 2>/dev/null)
   fi
 else
-  folder_display="~"
+  # no cache yet — try a fast inline fetch; fall back to silent omit
+  weather=$(curl -sf --max-time 1 'wttr.in/?format=%t+%C' 2>/dev/null || true)
+  [ -n "$weather" ] && echo "$weather" > "$WEATHER_CACHE"
 fi
 
-# --- MODEL NAME ---
-model_name=$(echo "$input" | jq -r '.model.display_name // "Unknown"')
-model_short=$(echo "$model_name" | sed -E 's/Claude ([0-9.]+) (.*)/\2 \1/' | sed 's/Sonnet 4/Sonnet 4/')
+# ── Helper: pct color ──────────────────────────────────────────────────────────
+_pct_color() {
+  local pct=$1
+  if   [ "$pct" -ge 80 ]; then printf '%s' "$RED"
+  elif [ "$pct" -ge 60 ]; then printf '%s' "$YELLOW"
+  else                          printf '%s' "$GREEN"
+  fi
+}
 
-# --- USAGE (cached 60s, reads OAuth token from macOS Keychain) ---
-usage_cache="/tmp/claude_usage_cache"
-usage_display=""
+# ── Helper: reset-time label ───────────────────────────────────────────────────
+_reset_label() {
+  local epoch=$1 fmt=${2:-%-I:%M%p}
+  [ -z "$epoch" ] && return
+  # epoch must be a number
+  [[ "$epoch" =~ ^[0-9]+$ ]] || return
+  local hhmm
+  hhmm=$(date -r "$epoch" +"$fmt" 2>/dev/null || date -d "@$epoch" +"$fmt" 2>/dev/null || true)
+  [ -n "$hhmm" ] && printf ' %s↻%s%s' "$DIM" "$hhmm" "$RST"
+}
 
-if [ -f "$usage_cache" ]; then
-  cache_age=$(($(date +%s) - $(stat -f %m "$usage_cache" 2>/dev/null || echo 0)))
-  if [ $cache_age -lt 60 ]; then
-    usage_display=$(cat "$usage_cache")
+# ═══════════════════════════════════════════════════════════════════════════════
+# LINE 1 — header: dim rule + bold-blue title + time + weather
+# ═══════════════════════════════════════════════════════════════════════════════
+time_now=$(date +%-I:%M%p)
+line1="${HRULE}"$'\n'
+line1+="${DIM}─── ${RST}${BBLUE}LZ STATUSLINE${RST}"
+line1+="  ${DIM}${time_now}${RST}"
+[ -n "$weather" ] && line1+="  ${DIM}${weather}${RST}"
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LINE 2 — ENV: CC version + model
+# ═══════════════════════════════════════════════════════════════════════════════
+line2=""
+if [ -n "$version" ]; then
+  line2+="${DIM}CC:${RST} ${BLUE}${version}${RST}"
+fi
+if [ -n "$model" ]; then
+  [ -n "$line2" ] && line2+="  ${SEP}  "
+  line2+="${DIM}Model:${RST} ${CYAN}${model}${RST}"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LINE 3 — CONTEXT bar (30 blocks)
+# ═══════════════════════════════════════════════════════════════════════════════
+line3=""
+if [ -n "$used" ]; then
+  used_int=$(printf '%.0f' "$used")
+  bar_width=30
+  filled=$(( used_int * bar_width / 100 ))
+  free=$(( bar_width - filled ))
+
+  bar_color=$(_pct_color "$used_int")
+
+  filled_str=""
+  for (( i=0; i<filled; i++ )); do filled_str+="█"; done
+  free_str=""
+  for (( i=0; i<free; i++ )); do free_str+="⣿"; done
+
+  line3="${BLUE}◉ CONTEXT:${RST} "
+  line3+="${bar_color}${filled_str}${RST}"
+  line3+="${DIM}${bar_color}${free_str}${RST}"
+  line3+=" ${bar_color}${used_int}%${RST}"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LINE 4 — USAGE: rate limits + cost + duration
+# ═══════════════════════════════════════════════════════════════════════════════
+line4_parts=()
+
+if [ -n "$rl_5h" ]; then
+  pct5=$(printf '%.0f' "$rl_5h")
+  c=$(_pct_color "$pct5")
+  seg="${DIM}5H:${RST} ${c}${pct5}%${RST}"
+  seg+=$(_reset_label "$rl_5h_reset")
+  line4_parts+=("$seg")
+fi
+
+if [ -n "$rl_7d" ]; then
+  pct7=$(printf '%.0f' "$rl_7d")
+  c=$(_pct_color "$pct7")
+  seg="${DIM}WK:${RST} ${c}${pct7}%${RST}"
+  seg+=$(_reset_label "$rl_7d_reset" '%a %-m/%-d %-I:%M%p')
+  line4_parts+=("$seg")
+fi
+
+if [ -n "$cost" ]; then
+  cost_fmt=$(printf '%.2f' "$cost")
+  line4_parts+=("${YELLOW}\$${cost_fmt}${RST}")
+fi
+
+if [ -n "$duration_ms" ] && [[ "$duration_ms" =~ ^[0-9]+$ ]]; then
+  total_s=$(( duration_ms / 1000 ))
+  mins=$(( total_s / 60 ))
+  secs=$(( total_s % 60 ))
+  if [ "$mins" -gt 0 ]; then
+    line4_parts+=("${DIM}${mins}m ${secs}s${RST}")
+  else
+    line4_parts+=("${DIM}${secs}s${RST}")
   fi
 fi
 
-if [ -z "$usage_display" ]; then
-  # Try to read OAuth token from macOS Keychain
-  access_token=$(/usr/bin/security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-  if [ $? -eq 0 ] && [ -n "$access_token" ]; then
-    # Parse the JSON credentials to extract the actual token
-    token=$(echo "$access_token" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
-    if [ -n "$token" ]; then
-      # Fetch usage from Anthropic API
-      usage_json=$(curl -s --max-time 3 \
-        -H "Authorization: Bearer ${token}" \
-        -H "anthropic-beta: oauth-2025-04-20" \
-        -H "User-Agent: claude-code/2.1" \
-        "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+line4=""
+if [ "${#line4_parts[@]}" -gt 0 ]; then
+  line4="${YELLOW}▰ USAGE:${RST} "
+  first=1
+  for part in "${line4_parts[@]}"; do
+    [ "$first" -eq 1 ] && first=0 || line4+="  ${SEP}  "
+    line4+="$part"
+  done
+fi
 
-      if [ $? -eq 0 ] && [ -n "$usage_json" ]; then
-        five_hour=$(echo "$usage_json" | jq -r '.five_hour.utilization // empty' 2>/dev/null)
-        seven_day=$(echo "$usage_json" | jq -r '.seven_day.utilization // empty' 2>/dev/null)
-        five_reset=$(echo "$usage_json" | jq -r '.five_hour.resets_at // empty' 2>/dev/null)
-        seven_reset=$(echo "$usage_json" | jq -r '.seven_day.resets_at // empty' 2>/dev/null)
+# ═══════════════════════════════════════════════════════════════════════════════
+# LINE 5 — PWD: dir basename + git branch
+# ═══════════════════════════════════════════════════════════════════════════════
+dir_base="$(basename "$cwd")"
+line5="${CYAN}◆ PWD:${RST} ${dir_base}"
 
-        # Format reset times as relative durations
-        format_reset() {
-          local reset_at="$1"
-          if [ -z "$reset_at" ]; then echo ""; return; fi
-          # Use python for reliable ISO 8601 parsing (handles timezone offsets correctly)
-          local reset_epoch=$(python3 -c "
-from datetime import datetime, timezone
-import sys
-try:
-    dt = datetime.fromisoformat(sys.argv[1])
-    print(int(dt.timestamp()))
-except: pass
-" "$reset_at" 2>/dev/null)
-          if [ -z "$reset_epoch" ]; then echo ""; return; fi
-          local now_epoch=$(date +%s)
-          local diff=$(( reset_epoch - now_epoch ))
-          if [ $diff -le 0 ]; then echo ""; return; fi
-          local mins=$(( diff / 60 ))
-          if [ $mins -lt 60 ]; then
-            echo "${mins}m"
-          else
-            local hours=$(( mins / 60 ))
-            local rem=$(( mins % 60 ))
-            if [ $hours -ge 24 ]; then
-              local days=$(( hours / 24 ))
-              local rem_h=$(( hours % 24 ))
-              if [ $rem_h -gt 0 ]; then echo "${days}d ${rem_h}h"; else echo "${days}d"; fi
-            elif [ $rem -gt 0 ]; then
-              echo "${hours}h ${rem}m"
-            else
-              echo "${hours}h"
-            fi
-          fi
-        }
-
-        if [ -n "$five_hour" ]; then
-          five_pct=$(printf "%.0f" "$five_hour")
-          five_reset_str=$(format_reset "$five_reset")
-          if [ -n "$five_reset_str" ]; then
-            usage_display="5h: ${five_pct}% (${five_reset_str})"
-          else
-            usage_display="5h: ${five_pct}%"
-          fi
-        fi
-
-        if [ -n "$seven_day" ]; then
-          seven_pct=$(printf "%.0f" "$seven_day")
-          # Only show 7d if utilization >= 5% to keep the line clean
-          if [ "$seven_pct" -ge 5 ] 2>/dev/null; then
-            seven_reset_str=$(format_reset "$seven_reset")
-            if [ -n "$seven_reset_str" ]; then
-              seven_part="7d: ${seven_pct}% (${seven_reset_str})"
-            else
-              seven_part="7d: ${seven_pct}%"
-            fi
-            if [ -n "$usage_display" ]; then
-              usage_display="${usage_display} | ${seven_part}"
-            else
-              usage_display="${seven_part}"
-            fi
-          fi
-        fi
-
-        # Cache the result
-        if [ -n "$usage_display" ]; then
-          echo "$usage_display" > "$usage_cache"
-        fi
-      fi
-    fi
+if branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null \
+            || git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null); then
+  dirty=""
+  if ! git -C "$cwd" --no-optional-locks diff --quiet --ignore-submodules -- 2>/dev/null \
+  || ! git -C "$cwd" --no-optional-locks diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
+    dirty="*"
   fi
+  line5+="  ${SEP}  🌿 ${GREEN}${branch}${dirty}${RST}"
 fi
 
-# --- LOCATION (cached 30 min by the Swift helper) ---
-location_cache="/tmp/claude_location_cache"
-lat=""
-lon=""
-
-# Try reading cached location first; if stale or missing, refresh via app bundle
-if [ -f "$location_cache" ]; then
-  cache_age=$(($(date +%s) - $(stat -f %m "$location_cache" 2>/dev/null || echo 0)))
-  if [ $cache_age -lt 1800 ]; then
-    coords=$(cat "$location_cache")
-    lat="${coords%%,*}"
-    lon="${coords##*,}"
-  fi
-fi
-
-if [ -z "$lat" ]; then
-  # Launch as app bundle (background-only, no Dock icon) so CoreLocation permission works
-  open -W "$HOME/.claude/ClaudeLocation.app" 2>/dev/null
-  if [ -f "$location_cache" ]; then
-    coords=$(cat "$location_cache")
-    lat="${coords%%,*}"
-    lon="${coords##*,}"
-  fi
-fi
-
-# --- WEATHER (cached 10 min) ---
-weather_cache="/tmp/claude_weather_cache"
-weather_display=""
-
-if [ -f "$weather_cache" ]; then
-  cache_age=$(($(date +%s) - $(stat -f %m "$weather_cache" 2>/dev/null || echo 0)))
-  if [ $cache_age -lt 600 ]; then
-    weather_display=$(cat "$weather_cache")
-  fi
-fi
-
-if [ -z "$weather_display" ] && [ -n "$lat" ]; then
-  weather_json=$(curl -s --max-time 2 "https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,weather_code&temperature_unit=fahrenheit&timezone=auto" 2>/dev/null)
-
-  if [ $? -eq 0 ] && [ -n "$weather_json" ]; then
-    temp=$(echo "$weather_json" | jq -r '.current.temperature_2m' 2>/dev/null)
-    weather_code=$(echo "$weather_json" | jq -r '.current.weather_code' 2>/dev/null)
-
-    case "$weather_code" in
-      0) icon="☀️";;
-      1|2|3) icon="⛅";;
-      45|48) icon="🌫️";;
-      51|53|55|61|63|65) icon="🌧️";;
-      71|73|75) icon="❄️";;
-      80|81|82) icon="🌦️";;
-      95|96|99) icon="⛈️";;
-      *) icon="🌡️";;
-    esac
-
-    if [ "$temp" != "null" ] && [ -n "$temp" ]; then
-      weather_display="${icon} ${temp}°F"
-      echo "$weather_display" > "$weather_cache"
-    fi
-  fi
-fi
-
-# --- OUTPUT STATUS LINE ---
-parts="📁 ${folder_display} | ${model_short}"
-if [ -n "$usage_display" ]; then
-  parts="${parts} | ${usage_display}"
-fi
-if [ -n "$weather_display" ]; then
-  parts="${parts} | ${weather_display}"
-fi
-printf "%s" "$parts"
+# ═══════════════════════════════════════════════════════════════════════════════
+# OUTPUT — emit all non-empty lines
+# ═══════════════════════════════════════════════════════════════════════════════
+printf '%s\n' "$line1"
+[ -n "$line2" ] && printf '%s\n' "$line2"
+[ -n "$line3" ] && printf '%s\n' "$line3"
+[ -n "$line4" ] && printf '%s\n' "$line4"
+printf '%s\n' "$line5"
+printf '%s\n' "$HRULE"
