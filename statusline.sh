@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# LZ Claude Code status line — PAI-style, 5-line layout
+# LZ Claude Code status line — compact 3-line layout
+#   1: model · CC version │ date + time + weather
+#   2: context bar │ rate limits / cost / duration
+#   3: pwd + git branch + ahead/behind
 # Receives Claude Code JSON on stdin; must stay fast (<100ms after first run)
 
 input=$(cat)
@@ -10,6 +13,8 @@ _j() { echo "$input" | jq -r "$1 // empty"; }
 version=$(_j '.version')
 model=$(_j '.model.display_name')
 used=$(_j '.context_window.used_percentage')
+ctx_used_tok=$(_j '.context_window.total_input_tokens')
+ctx_window=$(_j '.context_window.context_window_size')
 cost=$(_j '.cost_usd')
 duration_ms=$(_j '.total_duration_ms')
 rl_5h=$(_j '.rate_limits.five_hour.used_percentage')
@@ -28,11 +33,9 @@ CYAN=$'\033[36m'
 GREEN=$'\033[32m'
 YELLOW=$'\033[33m'
 RED=$'\033[31m'
-BBLUE=$'\033[1;34m'   # bold blue
+MAGENTA=$'\033[35m'
 SEP="${DIM}│${RST}"   # dim pipe separator
-
-# Dim separator line (horizontal rule)
-HRULE="${DIM}────────────────────────────────────────────────────────────${RST}"
+DOT=" ${DIM}·${RST} " # dim middle-dot separator
 
 # ── Weather (cached, 30-min TTL, non-blocking) ─────────────────────────────────
 WEATHER_CACHE=/tmp/claude-statusline-weather
@@ -77,35 +80,45 @@ _reset_label() {
   [ -n "$hhmm" ] && printf ' %s↻%s%s' "$DIM" "$hhmm" "$RST"
 }
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LINE 1 — header: dim rule + bold-blue title + time + weather
-# ═══════════════════════════════════════════════════════════════════════════════
-time_now=$(date +%-I:%M%p)
-line1="${HRULE}"$'\n'
-line1+="${DIM}─── ${RST}${BBLUE}LZ STATUSLINE${RST}"
-line1+="  ${DIM}${time_now}${RST}"
-[ -n "$weather" ] && line1+="  ${DIM}${weather}${RST}"
+# ── Helpers: visible width (ANSI stripped) + right-padding ─────────────────────
+_vlen() {
+  local s
+  s=$(printf '%s' "$1" | sed $'s/\033\\[[0-9;]*m//g')
+  printf '%d' "${#s}"
+}
+_pad_to() {
+  local s=$1 n
+  n=$(_vlen "$s")
+  while [ "$n" -lt "$2" ]; do s+=" "; n=$((n+1)); done
+  printf '%s' "$s"
+}
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LINE 2 — ENV: CC version + model
+# LINE 1 — model · CC version │ date + time + weather
 # ═══════════════════════════════════════════════════════════════════════════════
-line2=""
+env=""
+[ -n "$model" ] && env+="${CYAN}${model}${RST}"
 if [ -n "$version" ]; then
-  line2+="${DIM}CC:${RST} ${BLUE}${version}${RST}"
+  [ -n "$env" ] && env+="$DOT"
+  env+="${DIM}CC ${version}${RST}"
 fi
-if [ -n "$model" ]; then
-  [ -n "$line2" ] && line2+="  ${SEP}  "
-  line2+="${DIM}Model:${RST} ${CYAN}${model}${RST}"
-fi
+l1_left=""
+[ -n "$env" ] && l1_left="${MAGENTA}✦${RST} ${env}"
+
+time_now=$(date '+%a %-m/%-d %-I:%M%p')
+l1_right="${CYAN}◷${RST} ${DIM}${time_now}${RST}"
+[ -n "$weather" ] && l1_right+="  ${YELLOW}☼${RST} ${DIM}${weather}${RST}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# LINE 3 — CONTEXT bar (30 blocks)
+# LINE 2 — context bar │ rate limits / cost / duration
 # ═══════════════════════════════════════════════════════════════════════════════
-line3=""
+l2_left=""
 if [ -n "$used" ]; then
   used_int=$(printf '%.0f' "$used")
-  bar_width=30
+  bar_width=10
   filled=$(( used_int * bar_width / 100 ))
+  # always show at least one block once any context is used
+  [ "$used_int" -gt 0 ] && [ "$filled" -eq 0 ] && filled=1
   free=$(( bar_width - filled ))
 
   bar_color=$(_pct_color "$used_int")
@@ -115,36 +128,42 @@ if [ -n "$used" ]; then
   free_str=""
   for (( i=0; i<free; i++ )); do free_str+="⣿"; done
 
-  line3="${BLUE}◉ CONTEXT:${RST} "
-  line3+="${bar_color}${filled_str}${RST}"
-  line3+="${DIM}${bar_color}${free_str}${RST}"
-  line3+=" ${bar_color}${used_int}%${RST}"
+  # Format token counts as e.g. "87k/200k"
+  ctx_tok_label=""
+  if [ -n "$ctx_used_tok" ] && [ -n "$ctx_window" ] \
+     && [[ "$ctx_used_tok" =~ ^[0-9]+$ ]] && [[ "$ctx_window" =~ ^[0-9]+$ ]]; then
+    _k() { printf '%dk' "$(( ($1 + 500) / 1000 ))"; }
+    ctx_tok_label=" ${DIM}$(_k "$ctx_used_tok")/$(_k "$ctx_window")${RST}"
+  fi
+
+  l2_left="${BLUE}◉ CTX${RST} "
+  l2_left+="${bar_color}${filled_str}${RST}"
+  l2_left+="${DIM}${bar_color}${free_str}${RST}"
+  l2_left+=" ${bar_color}${used_int}%${RST}"
+  l2_left+="${ctx_tok_label}"
 fi
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# LINE 4 — USAGE: rate limits + cost + duration
-# ═══════════════════════════════════════════════════════════════════════════════
-line4_parts=()
+usage_parts=()
 
 if [ -n "$rl_5h" ]; then
   pct5=$(printf '%.0f' "$rl_5h")
   c=$(_pct_color "$pct5")
-  seg="${DIM}5H:${RST} ${c}${pct5}%${RST}"
+  seg="${DIM}5H${RST} ${c}${pct5}%${RST}"
   seg+=$(_reset_label "$rl_5h_reset")
-  line4_parts+=("$seg")
+  usage_parts+=("$seg")
 fi
 
 if [ -n "$rl_7d" ]; then
   pct7=$(printf '%.0f' "$rl_7d")
   c=$(_pct_color "$pct7")
-  seg="${DIM}WK:${RST} ${c}${pct7}%${RST}"
-  seg+=$(_reset_label "$rl_7d_reset" '%a %-m/%-d %-I:%M%p')
-  line4_parts+=("$seg")
+  seg="${DIM}WK${RST} ${c}${pct7}%${RST}"
+  seg+=$(_reset_label "$rl_7d_reset" '%a %-I:%M%p')
+  usage_parts+=("$seg")
 fi
 
 if [ -n "$cost" ]; then
   cost_fmt=$(printf '%.2f' "$cost")
-  line4_parts+=("${YELLOW}\$${cost_fmt}${RST}")
+  usage_parts+=("${YELLOW}\$${cost_fmt}${RST}")
 fi
 
 if [ -n "$duration_ms" ] && [[ "$duration_ms" =~ ^[0-9]+$ ]]; then
@@ -152,27 +171,48 @@ if [ -n "$duration_ms" ] && [[ "$duration_ms" =~ ^[0-9]+$ ]]; then
   mins=$(( total_s / 60 ))
   secs=$(( total_s % 60 ))
   if [ "$mins" -gt 0 ]; then
-    line4_parts+=("${DIM}${mins}m ${secs}s${RST}")
+    usage_parts+=("${DIM}${mins}m ${secs}s${RST}")
   else
-    line4_parts+=("${DIM}${secs}s${RST}")
+    usage_parts+=("${DIM}${secs}s${RST}")
   fi
 fi
 
-line4=""
-if [ "${#line4_parts[@]}" -gt 0 ]; then
-  line4="${YELLOW}▰ USAGE:${RST} "
+l2_right=""
+if [ "${#usage_parts[@]}" -gt 0 ]; then
+  l2_right="${YELLOW}◎${RST} "
   first=1
-  for part in "${line4_parts[@]}"; do
-    [ "$first" -eq 1 ] && first=0 || line4+="  ${SEP}  "
-    line4+="$part"
+  for part in "${usage_parts[@]}"; do
+    [ "$first" -eq 1 ] && first=0 || l2_right+="$DOT"
+    l2_right+="$part"
   done
 fi
 
+# ── Align the │ separators: pad both left segments to the same width ──────────
+if [ -n "$l1_left" ] && [ -n "$l1_right" ] && [ -n "$l2_left" ] && [ -n "$l2_right" ]; then
+  w1=$(_vlen "$l1_left")
+  w2=$(_vlen "$l2_left")
+  maxw=$(( w1 > w2 ? w1 : w2 ))
+  l1_left=$(_pad_to "$l1_left" "$maxw")
+  l2_left=$(_pad_to "$l2_left" "$maxw")
+fi
+
+line1="$l1_left"
+if [ -n "$l1_right" ]; then
+  [ -n "$line1" ] && line1+="  ${SEP}  "
+  line1+="$l1_right"
+fi
+
+line2="$l2_left"
+if [ -n "$l2_right" ]; then
+  [ -n "$line2" ] && line2+="  ${SEP}  "
+  line2+="$l2_right"
+fi
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# LINE 5 — PWD: dir basename + git branch
+# LINE 3 — pwd + git branch
 # ═══════════════════════════════════════════════════════════════════════════════
 dir_base="$(basename "$cwd")"
-line5="${CYAN}◆ PWD:${RST} ${dir_base}"
+line3="${CYAN}◆${RST} ${dir_base}"
 
 if branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null \
             || git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null); then
@@ -181,7 +221,15 @@ if branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/n
   || ! git -C "$cwd" --no-optional-locks diff --cached --quiet --ignore-submodules -- 2>/dev/null; then
     dirty="*"
   fi
-  line5+="  ${SEP}  🌿 ${GREEN}${branch}${dirty}${RST}"
+  line3+="  ${GREEN}⎇ ${branch}${RST}${YELLOW}${dirty}${RST}"
+
+  # ahead/behind vs upstream (rev-list prints "<behind><TAB><ahead>")
+  if ab=$(git -C "$cwd" --no-optional-locks rev-list --left-right --count '@{upstream}...HEAD' 2>/dev/null); then
+    behind=${ab%%	*}
+    ahead=${ab##*	}
+    [ "$ahead"  != "0" ] && line3+=" ${GREEN}↑${ahead}${RST}"
+    [ "$behind" != "0" ] && line3+=" ${RED}↓${behind}${RST}"
+  fi
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -189,7 +237,4 @@ fi
 # ═══════════════════════════════════════════════════════════════════════════════
 printf '%s\n' "$line1"
 [ -n "$line2" ] && printf '%s\n' "$line2"
-[ -n "$line3" ] && printf '%s\n' "$line3"
-[ -n "$line4" ] && printf '%s\n' "$line4"
-printf '%s\n' "$line5"
-printf '%s\n' "$HRULE"
+printf '%s\n' "$line3"
