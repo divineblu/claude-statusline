@@ -12,6 +12,7 @@ _j() { echo "$input" | jq -r "$1 // empty"; }
 
 version=$(_j '.version')
 model=$(_j '.model.display_name')
+effort=$(_j '.effort.level')
 used=$(_j '.context_window.used_percentage')
 ctx_used_tok=$(_j '.context_window.total_input_tokens')
 ctx_window=$(_j '.context_window.context_window_size')
@@ -98,16 +99,26 @@ _pad_to() {
 # ═══════════════════════════════════════════════════════════════════════════════
 env=""
 [ -n "$model" ] && env+="${CYAN}${model}${RST}"
+if [ -n "$effort" ]; then
+  # 4-segment gauge, filled count = level (uniform glyph height)
+  case "$effort" in
+    low)    eff_icon="▮▯▯▯" ;;
+    medium) eff_icon="▮▮▯▯" ;;
+    high)   eff_icon="▮▮▮▯" ;;
+    *)      eff_icon="▮▮▮▮" ;;  # xhigh / max
+  esac
+  env+="  ${MAGENTA}${eff_icon} ${effort}${RST}"
+fi
 if [ -n "$version" ]; then
   [ -n "$env" ] && env+="$DOT"
   env+="${DIM}CC ${version}${RST}"
 fi
 l1_left=""
-[ -n "$env" ] && l1_left="${MAGENTA}✦${RST} ${env}"
+[ -n "$env" ] && l1_left="${MAGENTA}✻${RST} ${env}"
 
 time_now=$(date '+%a %-m/%-d %-I:%M%p')
 l1_right="${CYAN}◷${RST} ${DIM}${time_now}${RST}"
-[ -n "$weather" ] && l1_right+="  ${YELLOW}☼${RST} ${DIM}${weather}${RST}"
+[ -n "$weather" ] && l1_right+="  ${YELLOW}☀︎${RST} ${DIM}${weather}${RST}"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LINE 2 — context bar │ rate limits / cost / duration
@@ -115,18 +126,7 @@ l1_right="${CYAN}◷${RST} ${DIM}${time_now}${RST}"
 l2_left=""
 if [ -n "$used" ]; then
   used_int=$(printf '%.0f' "$used")
-  bar_width=10
-  filled=$(( used_int * bar_width / 100 ))
-  # always show at least one block once any context is used
-  [ "$used_int" -gt 0 ] && [ "$filled" -eq 0 ] && filled=1
-  free=$(( bar_width - filled ))
-
   bar_color=$(_pct_color "$used_int")
-
-  filled_str=""
-  for (( i=0; i<filled; i++ )); do filled_str+="█"; done
-  free_str=""
-  for (( i=0; i<free; i++ )); do free_str+="⣿"; done
 
   # Format token counts as e.g. "87k/200k"
   ctx_tok_label=""
@@ -136,11 +136,29 @@ if [ -n "$used" ]; then
     ctx_tok_label=" ${DIM}$(_k "$ctx_used_tok")/$(_k "$ctx_window")${RST}"
   fi
 
-  l2_left="${BLUE}◉ CTX${RST} "
+  # size the bar so the left segment runs right up to the │ (aligned with line 1)
+  ctx_prefix="${BLUE}⛁ CTX${RST} "
+  ctx_suffix=" ${bar_color}${used_int}%${RST}${ctx_tok_label}"
+  bar_width=10
+  if [ -n "$l1_left" ]; then
+    avail=$(( $(_vlen "$l1_left") - $(_vlen "$ctx_prefix") - $(_vlen "$ctx_suffix") ))
+    [ "$avail" -gt "$bar_width" ] && bar_width=$avail
+  fi
+
+  filled=$(( used_int * bar_width / 100 ))
+  # always show at least one block once any context is used
+  [ "$used_int" -gt 0 ] && [ "$filled" -eq 0 ] && filled=1
+  free=$(( bar_width - filled ))
+
+  filled_str=""
+  for (( i=0; i<filled; i++ )); do filled_str+="█"; done
+  free_str=""
+  for (( i=0; i<free; i++ )); do free_str+="⣿"; done
+
+  l2_left="${ctx_prefix}"
   l2_left+="${bar_color}${filled_str}${RST}"
   l2_left+="${DIM}${bar_color}${free_str}${RST}"
-  l2_left+=" ${bar_color}${used_int}%${RST}"
-  l2_left+="${ctx_tok_label}"
+  l2_left+="${ctx_suffix}"
 fi
 
 usage_parts=()
@@ -148,7 +166,7 @@ usage_parts=()
 if [ -n "$rl_5h" ]; then
   pct5=$(printf '%.0f' "$rl_5h")
   c=$(_pct_color "$pct5")
-  seg="${DIM}5H${RST} ${c}${pct5}%${RST}"
+  seg="${YELLOW}⧗${RST} ${DIM}5H${RST} ${c}${pct5}%${RST}"
   seg+=$(_reset_label "$rl_5h_reset")
   usage_parts+=("$seg")
 fi
@@ -156,7 +174,7 @@ fi
 if [ -n "$rl_7d" ]; then
   pct7=$(printf '%.0f' "$rl_7d")
   c=$(_pct_color "$pct7")
-  seg="${DIM}WK${RST} ${c}${pct7}%${RST}"
+  seg="${YELLOW}⧖${RST} ${DIM}WK${RST} ${c}${pct7}%${RST}"
   seg+=$(_reset_label "$rl_7d_reset" '%a %-I:%M%p')
   usage_parts+=("$seg")
 fi
@@ -179,7 +197,6 @@ fi
 
 l2_right=""
 if [ "${#usage_parts[@]}" -gt 0 ]; then
-  l2_right="${YELLOW}◎${RST} "
   first=1
   for part in "${usage_parts[@]}"; do
     [ "$first" -eq 1 ] && first=0 || l2_right+="$DOT"
@@ -212,7 +229,7 @@ fi
 # LINE 3 — pwd + git branch
 # ═══════════════════════════════════════════════════════════════════════════════
 dir_base="$(basename "$cwd")"
-line3="${CYAN}◆${RST} ${dir_base}"
+line3="${CYAN}❯${RST} ${dir_base}"
 
 if branch=$(git -C "$cwd" --no-optional-locks symbolic-ref --short HEAD 2>/dev/null \
             || git -C "$cwd" --no-optional-locks rev-parse --short HEAD 2>/dev/null); then
