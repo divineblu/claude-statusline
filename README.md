@@ -3,14 +3,14 @@
 A custom status line script for [Claude Code](https://claude.ai/code) that displays useful context at a glance in a compact 3-line layout.
 
 ```
-✦ Fable 5 · CC 2.1.170          │  ◷ Tue 6/9 8:19PM  ☼ +87°F Sunny
-◉ CTX ███⣿⣿⣿⣿⣿⣿⣿ 34% 43k/1000k  │  ◎ 5H 16% ↻10:40PM · WK 3% ↻Mon 6:00PM
-◆ orbixia  ⎇ main* ↑2 ↓1
+✻ Fable 5 · CC 2.1.170  ▮▮▮▯ high  │  ◷ Tue 6/9 8:19PM  ☀︎ +87°F Sunny
+⛁ CTX ███⣿⣿⣿⣿⣿⣿⣿ 34% 43k/1000k    │  ⧗ 5H 16% ↻10:40PM · ⧖ WK 3% ↻Mon 6:00PM
+❯ orbixia  ⎇ main* ↑2 ↓1
 ```
 
 ## What it shows
 
-- **Line 1** — model name and Claude Code version, then day/date/time and current weather ([wttr.in](https://wttr.in))
+- **Line 1** — model name and Claude Code version, effort-level gauge (`▮▮▮▯ high`), then day/date/time and current weather ([wttr.in](https://wttr.in))
 - **Line 2** — context-window gauge with token counts (e.g. `43k/1000k`), 5-hour and weekly rate-limit usage with reset times, plus session cost and duration when reported
 - **Line 3** — directory basename, git branch with dirty marker (`*`), and ahead/behind counts vs upstream (`↑2 ↓1`)
 
